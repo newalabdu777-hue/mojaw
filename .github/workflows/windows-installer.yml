@@ -1,0 +1,313 @@
+name: Windows desktop installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'desktop-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: frontend
+        shell: pwsh
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Validate desktop package configuration
+        run: |
+          node --version
+          npm --version
+          if (-not (Test-Path package.json)) {
+            Write-Error 'PACKAGE_PREFLIGHT_FAILED: package.json was not found in the frontend directory.'
+            exit 1
+          }
+          $pkg = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json
+          foreach ($scriptName in @('test', 'check:desktop', 'build')) {
+            if (-not $pkg.scripts.$scriptName) {
+              Write-Error "PACKAGE_PREFLIGHT_FAILED: required npm script '$scriptName' is missing."
+              exit 1
+            }
+          }
+          if (-not (Test-Path $pkg.main)) {
+            Write-Error "PACKAGE_PREFLIGHT_FAILED: Electron entry point '$($pkg.main)' does not exist."
+            exit 1
+          }
+          if ($pkg.build.win.target[0].target -ne 'nsis' -or $pkg.build.win.target[0].arch -notcontains 'x64') {
+            Write-Error 'PACKAGE_PREFLIGHT_FAILED: electron-builder must declare the NSIS x64 target.'
+            exit 1
+          }
+          Write-Host "Validated package $($pkg.name)@$($pkg.version), Electron entry '$($pkg.main)'."
+          if (-not (Test-Path package-lock.json)) {
+            Write-Warning 'No committed package-lock.json found. A lockfile will be generated from package.json on this runner, then attached to the build artifact for review and commit.'
+          }
+
+      - name: Generate package lockfile when missing
+        run: |
+          if (Test-Path -LiteralPath package-lock.json) {
+            $pkg = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json -ErrorAction Stop
+            try {
+              $lock = Get-Content -Raw -LiteralPath package-lock.json | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            } catch {
+              Write-Error 'LOCKFILE_VALIDATION_FAILED: committed package-lock.json is not valid JSON.'
+              exit 1
+            }
+            $rootPackage = $lock.packages['']
+            if ($lock.lockfileVersion -lt 2 -or -not $lock.packages -or -not $rootPackage) {
+              Write-Error 'LOCKFILE_VALIDATION_FAILED: committed package-lock.json has an unexpected format or is incomplete.'
+              exit 1
+            }
+            if ($rootPackage.name -ne $pkg.name -or $rootPackage.version -ne $pkg.version) {
+              Write-Error "LOCKFILE_VALIDATION_FAILED: lockfile root metadata does not match package.json ($($pkg.name)@$($pkg.version)). Regenerate the lockfile and commit both files together."
+              exit 1
+            }
+            Write-Host "Using validated committed package-lock.json ($((Get-Item package-lock.json).Length) bytes)."
+            exit 0
+          }
+          $env:npm_config_fetch_retries = '3'
+          $env:npm_config_fetch_retry_mintimeout = '20000'
+          $env:npm_config_fetch_retry_maxtimeout = '120000'
+          $attempt = 0
+          $maxAttempts = 2
+          $lockExitCode = 1
+          do {
+            $attempt++
+            Write-Host "Generating package-lock.json (attempt $attempt of $maxAttempts)."
+            npm install --package-lock-only --ignore-scripts --no-audit --no-fund --progress=false
+            $lockExitCode = $LASTEXITCODE
+            if ($lockExitCode -eq 0 -and (Test-Path -LiteralPath package-lock.json)) { break }
+            if ($attempt -lt $maxAttempts) {
+              Write-Warning "Lockfile generation failed with exit code $lockExitCode; retrying once."
+              Start-Sleep -Seconds 10
+            }
+          } while ($attempt -lt $maxAttempts)
+          if ($lockExitCode -ne 0 -or -not (Test-Path -LiteralPath package-lock.json)) {
+            Write-Error 'LOCKFILE_GENERATION_FAILED: npm could not create package-lock.json. Check registry DNS/proxy access and npm logs; do not hand-write the lockfile.'
+            exit 1
+          }
+          $pkg = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json -ErrorAction Stop
+          try {
+            $lock = Get-Content -Raw -LiteralPath package-lock.json | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+          } catch {
+            Write-Error 'LOCKFILE_GENERATION_FAILED: npm created a lockfile that is not valid JSON. Review npm logs and do not commit this file.'
+            exit 1
+          }
+          $rootPackage = $lock.packages['']
+          if ($lock.lockfileVersion -lt 2 -or -not $lock.packages -or -not $rootPackage) {
+            Write-Error 'LOCKFILE_GENERATION_FAILED: generated package-lock.json has an unexpected format or is incomplete.'
+            exit 1
+          }
+          if ($rootPackage.name -ne $pkg.name -or $rootPackage.version -ne $pkg.version) {
+            Write-Error "LOCKFILE_GENERATION_FAILED: lockfile root metadata does not match package.json ($($pkg.name)@$($pkg.version))."
+            exit 1
+          }
+          Write-Host "Generated and validated package-lock.json ($((Get-Item package-lock.json).Length) bytes); review and commit it for reproducible future builds."
+
+      - name: Upload package lockfile for review
+        id: upload-lockfile
+        if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-management-package-lock-${{ github.run_number }}
+          path: frontend/package-lock.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Diagnose package lockfile artifact upload failure
+        if: always() && steps.upload-lockfile.outcome == 'failure'
+        working-directory: .
+        shell: pwsh
+        run: |
+          Write-Error 'LOCKFILE_ARTIFACT_UPLOAD_FAILED: npm lockfile generation succeeded, but GitHub could not store the lockfile artifact. Check artifact service availability and repository permissions.'
+          exit 1
+
+      - name: Install dependencies with npm ci
+        run: |
+          $env:npm_config_fetch_retries = '3'
+          $env:npm_config_fetch_retry_mintimeout = '20000'
+          $env:npm_config_fetch_retry_maxtimeout = '120000'
+          if (-not (Test-Path -LiteralPath package-lock.json)) {
+            Write-Error 'DEPENDENCY_INSTALL_FAILED: package-lock.json is missing; lockfile generation must succeed before npm ci.'
+            exit 1
+          }
+          $attempt = 0
+          $maxAttempts = 2
+          $installExitCode = 1
+          do {
+            $attempt++
+            Write-Host "npm ci attempt $attempt of $maxAttempts"
+            npm ci --no-audit --no-fund --progress=false
+            $installExitCode = $LASTEXITCODE
+            if ($installExitCode -eq 0) { break }
+            if ($attempt -lt $maxAttempts) {
+              Write-Warning "Dependency installation failed with exit code $installExitCode. Retrying once."
+              Start-Sleep -Seconds 10
+            }
+          } while ($attempt -lt $maxAttempts)
+          if ($installExitCode -ne 0) {
+            Write-Error 'DEPENDENCY_INSTALL_FAILED: npm ci failed after two attempts. For EAI_AGAIN/ENOTFOUND/ECONNRESET, verify registry.npmjs.org DNS/network/proxy access; otherwise review package constraints and npm logs.'
+            exit 1
+          }
+          if (-not (Test-Path node_modules)) {
+            Write-Error 'DEPENDENCY_INSTALL_FAILED: npm ci reported success but node_modules is missing.'
+            exit 1
+          }
+          Write-Host "Dependency install succeeded; lockfile size: $((Get-Item package-lock.json).Length) bytes."
+
+      - name: Run frontend tests
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'FRONTEND_TESTS_FAILED: Node test suite failed; fix the failing test before packaging.'
+            exit 1
+          }
+
+      - name: Validate Electron main process
+        run: |
+          npm run check:desktop
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'ELECTRON_SYNTAX_CHECK_FAILED: inspect frontend/electron/main.cjs for JavaScript syntax errors.'
+            exit 1
+          }
+
+      - name: Build renderer for production
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'PRODUCTION_BUILD_FAILED: TypeScript or Vite build failed. Review the first compiler error above; confirm dependencies are installed and VITE_API_BASE_URL is valid if configured.'
+            exit 1
+          }
+          if (-not (Test-Path dist/index.html)) {
+            Write-Error 'PRODUCTION_BUILD_FAILED: dist/index.html was not created by Vite.'
+            exit 1
+          }
+
+      - name: Create NSIS installer
+        run: |
+          npx electron-builder --win nsis --x64 --publish never
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'NSIS_PACKAGING_FAILED: electron-builder could not create the Windows installer. Inspect builder output, Windows signing configuration, and available disk space.'
+            exit 1
+          }
+          $installers = @(Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            Write-Error 'NSIS_PACKAGING_FAILED: electron-builder returned success but no .exe was found under frontend/release.'
+            exit 1
+          }
+          foreach ($installer in $installers) {
+            if ($installer.Length -le 0) {
+              Write-Error "NSIS_PACKAGING_FAILED: installer '$($installer.Name)' is empty."
+              exit 1
+            }
+            Write-Host "Installer created: $($installer.FullName) ($($installer.Length) bytes)"
+          }
+
+      - name: Generate installer SHA-256 checksums
+        run: |
+          $installers = @(Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            Write-Error 'ARTIFACT_PREPARATION_FAILED: no installer executable is available to checksum.'
+            exit 1
+          }
+          $lines = foreach ($installer in $installers) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash
+            "$hash  $($installer.Name)"
+          }
+          $lines | Set-Content -LiteralPath 'release/installer-sha256.txt' -Encoding ascii
+          foreach ($installer in $installers) {
+            $expected = ($lines | Where-Object { $_ -like "*  $($installer.Name)" } | Select-Object -First 1).Split(' ')[0]
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash
+            if ($actual -ne $expected) {
+              Write-Error "ARTIFACT_PREPARATION_FAILED: SHA-256 verification failed for '$($installer.Name)'."
+              exit 1
+            }
+          }
+          Get-Content -LiteralPath 'release/installer-sha256.txt'
+
+      - name: Generate installer build manifest
+        run: |
+          $pkg = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json
+          $installers = @(Get-ChildItem -Path release -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            Write-Error 'ARTIFACT_PREPARATION_FAILED: cannot create build manifest because no installer executable exists.'
+            exit 1
+          }
+          $manifest = @(
+            'School Management System - Windows installer build'
+            "Product: $($pkg.name)"
+            "Version: $($pkg.version)"
+            "Git commit: $env:GITHUB_SHA"
+            "GitHub run: $env:GITHUB_RUN_ID"
+            "Run number: $env:GITHUB_RUN_NUMBER"
+            "Node.js: $(node --version)"
+            "npm: $(npm --version)"
+            "Built at (UTC): $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            ''
+            'Installers:'
+          )
+          foreach ($installer in $installers) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash
+            $manifest += "$($installer.Name) | $($installer.Length) bytes | SHA-256 $hash"
+          }
+          $manifest | Set-Content -LiteralPath 'release/installer-build-info.txt' -Encoding utf8
+          Get-Content -LiteralPath 'release/installer-build-info.txt'
+
+      - name: Upload installer artifacts
+        id: upload-installer
+        if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-management-windows-installer-${{ github.run_number }}
+          path: |
+            frontend/release/*.exe
+            frontend/release/installer-sha256.txt
+            frontend/release/installer-build-info.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Diagnose artifact upload failure
+        if: always() && steps.upload-installer.outcome == 'failure'
+        working-directory: .
+        shell: pwsh
+        run: |
+          Write-Error 'ARTIFACT_UPLOAD_FAILED: the installer was built, but GitHub could not store the artifact. Check Actions artifact service availability, repository permissions, and run logs.'
+          exit 1
+
+      - name: Write build summary
+        if: always()
+        working-directory: .
+        shell: pwsh
+        run: |
+          "## Windows installer build" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Trigger: ${{ github.event_name }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Ref: ${{ github.ref }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ('${{ job.status }}' -eq 'success') {
+            '- Result: **success**. Download the `school-management-windows-installer-*` artifact from this run.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            if ('${{ steps.upload-installer.outputs.artifact-url }}' -ne '') {
+              "- Artifact URL: ${{ steps.upload-installer.outputs.artifact-url }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+          } else {
+            '- Result: **failed**. Find the first step marked `*_FAILED` in the logs for the likely failure stage.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
